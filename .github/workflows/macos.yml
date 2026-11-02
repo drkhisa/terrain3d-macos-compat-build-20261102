@@ -1,0 +1,98 @@
+name: Terrain3D macOS compatibility
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: terrain-macos-compat
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - name: Checkout pinned upstream source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: TokisanGames/Terrain3D
+          ref: 629bbd65526bbdc3d1aa371840c7028055c30b02
+          submodules: recursive
+          persist-credentials: false
+          path: terrain
+      - name: Prepare pinned SCons
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          printf '%s\n' 'SCons==4.9.1 --hash=sha256:d2db1a22eb6039e97cbbb0106f18f435af033d0aad190299c9688378e2810a5e' > requirements.txt
+          .venv/bin/python -m pip install --disable-pip-version-check --no-deps --require-hashes -r requirements.txt
+          test "$(git -C terrain/godot-cpp rev-parse HEAD)" = 60b5a4196de8442b43b32ba68ebe1e79cfcb762f
+          mkdir -p out/standard out/legacy
+          xcodebuild -version > out/toolchain.txt
+          xcrun --sdk macosx --show-sdk-version >> out/toolchain.txt
+          cp terrain/LICENSE.txt out/LICENSE-Terrain3D.txt
+          cp terrain/godot-cpp/LICENSE.md out/LICENSE-godot-cpp.txt
+      - name: Build Standard universal minimum macOS 13
+        shell: bash
+        working-directory: terrain
+        run: |
+          set -euo pipefail
+          ../.venv/bin/scons platform=macos target=template_release arch=universal macos_deployment_target=13.0 -j3
+          cp project/addons/terrain_3d/bin/libterrain.macos.release.framework/libterrain.macos.release ../out/standard/
+          codesign --force --sign - ../out/standard/libterrain.macos.release
+          codesign --verify --strict ../out/standard/libterrain.macos.release
+      - name: Build Legacy Intel minimum macOS 10.15
+        shell: bash
+        working-directory: terrain
+        run: |
+          set -euo pipefail
+          ../.venv/bin/scons platform=macos target=template_release arch=x86_64 macos_deployment_target=10.15 -j3
+          cp project/addons/terrain_3d/bin/libterrain.macos.release.framework/libterrain.macos.release ../out/legacy/
+          codesign --force --sign - ../out/legacy/libterrain.macos.release
+          codesign --verify --strict ../out/legacy/libterrain.macos.release
+      - name: Inspect actual native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for kind in standard legacy; do
+            file "out/$kind/libterrain.macos.release" > "out/$kind/file.txt"
+            otool -l "out/$kind/libterrain.macos.release" > "out/$kind/load-commands.txt"
+            otool -L "out/$kind/libterrain.macos.release" > "out/$kind/dependencies.txt"
+            nm -u "out/$kind/libterrain.macos.release" > "out/$kind/undefined.txt"
+            shasum -a 256 "out/$kind/libterrain.macos.release" > "out/$kind/sha256.txt"
+          done
+      - name: Native ARM64 Godot 4.7.2 library smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 1 --max-time 180 --output godot.zip https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_macos.universal.zip
+          printf '%s\n' 'c58a24e31d720be9d62f60cb5627c4e695fb72f21b0cfe1bc9ccaa9a3b3ba63e  godot.zip' | shasum -a 256 --check
+          ditto -x -k godot.zip godot
+          mkdir -p smoke/bin/libterrain.macos.release.framework
+          cp out/standard/libterrain.macos.release smoke/bin/libterrain.macos.release.framework/
+          printf '%s\n' 'config_version=5' '[application]' 'config/name="Terrain native smoke"' > smoke/project.godot
+          printf '%s\n' '[configuration]' 'entry_symbol="terrain_3d_init"' 'compatibility_minimum="4.5"' '[libraries]' 'macos="res://bin/libterrain.macos.release.framework"' > smoke/terrain.gdextension
+          cat > smoke/smoke.gd <<'GD'
+          extends SceneTree
+          func _initialize() -> void:
+              assert(Engine.get_version_info().string == "4.7.2-stable (official)")
+              var status := GDExtensionManager.load_extension("res://terrain.gdextension")
+              assert(status == GDExtensionManager.LOAD_STATUS_OK)
+              assert(ClassDB.class_exists("Terrain3D"))
+              var terrain: Object = ClassDB.instantiate("Terrain3D")
+              assert(terrain != null)
+              terrain.free()
+              print("TERRAIN_MAC_NATIVE_SMOKE_PASS")
+              quit(0)
+          GD
+          godot/Godot.app/Contents/MacOS/Godot --headless --path smoke --script res://smoke.gd > out/native-smoke.log 2>&1
+          grep -q TERRAIN_MAC_NATIVE_SMOKE_PASS out/native-smoke.log
+          if grep -E 'SCRIPT ERROR|ERROR:' out/native-smoke.log; then exit 1; fi
+      - name: Upload only native outputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: terrain3d-macos-compat
+          path: out/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
